@@ -12,22 +12,24 @@ pub struct Buzzer<'d, T: GeneralInstance4Channel> {
 
 impl<'d, T: GeneralInstance4Channel> Buzzer<'d, T> {
     pub fn new(pwm: SimplePwm<'d, T>, channel: Channel) -> Self {
-        Self { pwm, channel }
+        let mut b = Self { pwm, channel };
+        b.pwm.enable(channel);
+        b.off();
+        b
     }
 
     pub fn on(&mut self) {
         let max = self.pwm.get_max_duty();
         self.pwm.set_duty(self.channel, max / 2);
-        self.pwm.enable(self.channel);
     }
 
     pub fn off(&mut self) {
-        self.pwm.disable(self.channel);
+        self.pwm.set_duty(self.channel, 0);
     }
 
-    pub async fn beep(&mut self, duration_ms: u64) {
+    pub async fn beep(&mut self, ms: u64) {
         self.on();
-        Timer::after_millis(duration_ms).await;
+        Timer::after_millis(ms).await;
         self.off();
     }
 }
