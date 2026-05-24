@@ -144,7 +144,12 @@ async fn hc_task(
         let duration = Instant::now().duration_since(start_time).as_micros();
 
         if duration < 30000 {
-            let distance_cm = duration / 58;
+            // Compensare viteza sunetului cu temperatura si umiditate
+            // v_sound (m/s) = 331.4 + 0.606*T + 0.0124*H
+            let temperature_c: f32 = 25.0; // °C - ajusteaza dupa mediu
+            let humidity_pct: f32 = 60.0;  // %  - ajusteaza dupa mediu
+            let v_sound = 331.4_f32 + 0.606 * temperature_c + 0.0124 * humidity_pct;
+            let distance_cm = (v_sound * duration as f32 / 20000.0) as u64;
             info!("--- HC-SR04 --- Distanta: {} cm", distance_cm);
 
             if distance_cm < 30 {
