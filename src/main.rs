@@ -1,10 +1,6 @@
 #![no_std]
 #![no_main]
 
-mod buzzer;
-mod servo;
-
-use buzzer::Buzzer;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::flash::{Blocking, Flash};
@@ -13,14 +9,73 @@ use embassy_stm32::peripherals::{FLASH, PA3, PA5, PA6, PA7, PA8, PB5, PB10, PC7,
 use embassy_stm32::spi::{Config as SpiConfig, Spi};
 use embassy_stm32::time::hz;
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
-use embassy_stm32::timer::{low_level::CountingMode, Channel};
+use embassy_stm32::timer::{low_level::CountingMode, Channel, GeneralInstance4Channel};
 use embassy_stm32::Peri;
 use embassy_time::{Delay, Instant, Timer};
+use embedded_hal::Pwm;
 use mfrc522::Mfrc522;
-use servo::Servo;
 use {defmt_rtt as _, panic_probe as _};
 
-// --- Flash (memorie persistenta pentru puncte RFID) ---
+// --- Buzzer ---
+
+struct Buzzer<'d, T: GeneralInstance4Channel> {
+    pwm: SimplePwm<'d, T>,
+    channel: Channel,
+}
+
+impl<'d, T: GeneralInstance4Channel> Buzzer<'d, T> {
+    fn new(pwm: SimplePwm<'d, T>, channel: Channel) -> Self {
+        let mut b = Self { pwm, channel };
+        b.pwm.enable(channel);
+        b.off();
+        b
+    }
+
+    fn on(&mut self) {
+        let max = self.pwm.get_max_duty();
+        self.pwm.set_duty(self.channel, max / 2);
+    }
+
+    fn off(&mut self) {
+        self.pwm.set_duty(self.channel, 0);
+    }
+
+    async fn beep(&mut self, ms: u64) {
+        self.on();
+        Timer::after_millis(ms).await;
+        self.off();
+    }
+}
+
+// --- Servo ---
+
+const PULSE_MIN_US: u32 = 500;
+const PULSE_MAX_US: u32 = 2500;
+const PERIOD_US: u32 = 20_000;
+
+struct Servo<'d, T: GeneralInstance4Channel> {
+    pwm: SimplePwm<'d, T>,
+    channel: Channel,
+}
+
+impl<'d, T: GeneralInstance4Channel> Servo<'d, T> {
+    fn new(pwm: SimplePwm<'d, T>, channel: Channel) -> Self {
+        let mut s = Self { pwm, channel };
+        s.pwm.enable(channel);
+        s
+    }
+
+    fn set_angle(&mut self, angle: i32) {
+        let angle = angle.clamp(-90, 90);
+        let pulse_us = (((angle + 90) as u32) * (PULSE_MAX_US - PULSE_MIN_US) / 180) + PULSE_MIN_US;
+        let max = self.pwm.get_max_duty() as u32;
+        let duty = (pulse_us * max) / PERIOD_US;
+        self.pwm.set_duty(self.channel, duty);
+    }
+}
+
+// --- Flash (persistent memory for RFID points) ---
+
 const STORAGE_OFFSET: u32 = 504 * 1024;
 const MAGIC: u32 = 0xAB_CD_12_34;
 
@@ -43,7 +98,8 @@ fn save_points(flash: &mut Flash<Blocking>, points: u32) {
     flash.blocking_write(STORAGE_OFFSET, &buf).ok();
 }
 
-// --- RFID (RC522) --- SPI1: SCK=PA5, MOSI=PA7, MISO=PA6, CS=PA8, RST=PA3 ---
+// --- RFID task --- SPI1: SCK=PA5, MOSI=PA7, MISO=PA6, CS=PA8, RST=PA3 ---
+
 #[embassy_executor::task]
 async fn rfid_task(
     flash_periph: Peri<'static, FLASH>,
@@ -54,10 +110,8 @@ async fn rfid_task(
     cs: Peri<'static, PA8>,
     rst: Peri<'static, PA3>,
 ) {
-    // Flash - stocare puncte
     let mut flash = Flash::new_blocking(flash_periph);
 
-    // RFID - initializare SPI si reset
     let mut rfid_rst = Output::new(rst, Level::High, Speed::Low);
     let rfid_cs = Output::new(cs, Level::High, Speed::Low);
     let spi = Spi::new_blocking(spi, sck, mosi, miso, SpiConfig::default());
@@ -72,12 +126,10 @@ async fn rfid_task(
 
     let mut rfid = rfid.init().unwrap();
 
-    // Flash - citire puncte salvate la pornire
     let mut puncte = read_points(&mut flash);
     info!("RFID initializat. Puncte salvate: {}", puncte);
 
     loop {
-        // RFID - detectare card
         if let Ok(atqa) = rfid.reqa() {
             if let Ok(uid) = rfid.select(&atqa) {
                 let id = uid.as_bytes();
@@ -86,8 +138,6 @@ async fn rfid_task(
                 info!("Card detectat! UID: {=[u8]:x}", id);
                 info!("Felicitari! Ai reciclat cu succes!");
                 info!("Ai primit 200 de puncte. Total puncte: {}", puncte);
-
-                // Flash - salvare puncte dupa fiecare scanare
                 save_points(&mut flash, puncte);
                 Timer::after_secs(2).await;
             }
@@ -96,9 +146,9 @@ async fn rfid_task(
     }
 }
 
-// --- HC-SR04 (senzor ultrasonic) --- TRIG=PC7, ECHO=PC8 ---
-// --- Servo (SG90)               --- TIM3 CH2, semnal=PB5  ---
-// --- Buzzer (KY-006)            --- TIM2 CH3, semnal=PB10 ---
+// --- HC-SR04 + Servo + Buzzer task ---
+// TRIG=PC7, ECHO=PC8, Servo=PB5 (TIM3 CH2), Buzzer=PB10 (TIM2 CH3)
+
 #[embassy_executor::task]
 async fn hc_task(
     trig_pin: Peri<'static, PC7>,
@@ -108,32 +158,25 @@ async fn hc_task(
     tim2: Peri<'static, TIM2>,
     pb10: Peri<'static, PB10>,
 ) {
-    // HC-SR04 - pini trig si echo
     let mut trig = Output::new(trig_pin, Level::Low, Speed::VeryHigh);
     let echo = Input::new(echo_pin, Pull::None);
 
-    // Servo - TIM3 CH2 pe PB5, frecventa 50Hz
     let ch2 = PwmPin::new(pb5, OutputType::PushPull);
     let pwm_servo = SimplePwm::new(tim3, None, Some(ch2), None, None, hz(50), CountingMode::EdgeAlignedUp);
     let mut servo = Servo::new(pwm_servo, Channel::Ch2);
 
-    // Buzzer - TIM2 CH3 pe PB10, frecventa 2kHz
     let ch3 = PwmPin::new(pb10, OutputType::PushPull);
     let pwm_buzzer = SimplePwm::new(tim2, None, None, Some(ch3), None, hz(2000), CountingMode::EdgeAlignedUp);
     let mut buzzer = Buzzer::new(pwm_buzzer, Channel::Ch3);
 
-    // Servo - pozitie initiala 0 grade
     servo.set_angle(-90);
-
     info!("HC-SR04 initializat. Masor distanta...");
 
     loop {
-        // HC-SR04 - trimitere puls de 10µs
         trig.set_high();
         Timer::after_micros(10).await;
         trig.set_low();
 
-        // HC-SR04 - masurare durata echo
         while echo.is_low() {}
         let start_time = Instant::now();
         while echo.is_high() {
@@ -144,20 +187,19 @@ async fn hc_task(
         let duration = Instant::now().duration_since(start_time).as_micros();
 
         if duration < 30000 {
-            // Compensare viteza sunetului cu temperatura si umiditate
             // v_sound (m/s) = 331.4 + 0.606*T + 0.0124*H
-            let temperature_c: f32 = 25.0; // °C - ajusteaza dupa mediu
-            let humidity_pct: f32 = 60.0;  // %  - ajusteaza dupa mediu
+            let temperature_c: f32 = 25.0;
+            let humidity_pct: f32 = 60.0;
             let v_sound = 331.4_f32 + 0.606 * temperature_c + 0.0124 * humidity_pct;
             let distance_cm = (v_sound * duration as f32 / 20000.0) as u64;
             info!("--- HC-SR04 --- Distanta: {} cm", distance_cm);
 
             if distance_cm < 30 {
                 info!("Mana detectata la {} cm! Servo -> 0 grade.", distance_cm);
-                servo.set_angle(-90); // -90 in API = 0 grade fizic
+                servo.set_angle(-90);
                 buzzer.beep(200).await;
             } else {
-                servo.set_angle(0); // 0 in API = 90 grade fizic
+                servo.set_angle(0);
             }
         } else {
             info!("--- HC-SR04 --- Nu vad niciun obstacol in apropiere.");
@@ -169,17 +211,16 @@ async fn hc_task(
 }
 
 // --- Entry point ---
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
     info!("Sistem pornit!");
 
-    // Pornire task RFID + Flash
     spawner
         .spawn(rfid_task(p.FLASH, p.SPI1, p.PA5, p.PA7, p.PA6, p.PA8, p.PA3))
         .unwrap();
 
-    // Pornire task HC-SR04 + Servo + Buzzer
     spawner
         .spawn(hc_task(p.PC7, p.PC8, p.TIM3, p.PB5, p.TIM2, p.PB10))
         .unwrap();
